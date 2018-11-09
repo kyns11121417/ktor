@@ -1,16 +1,18 @@
 package io.ktor.client.engine.cio
 
-import io.ktor.util.cio.*
+import io.ktor.client.utils.*
 import io.ktor.http.*
 import io.ktor.http.cio.*
 import io.ktor.network.sockets.*
+import io.ktor.util.cio.*
 import io.ktor.util.date.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.channels.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.io.*
-import java.io.*
+import kotlinx.io.core.*
+import kotlinx.io.pool.*
 import java.nio.channels.*
 import kotlin.coroutines.*
 
@@ -80,7 +82,10 @@ internal class ConnectionPipeline(
                     val hasBody = (contentLength > 0 || chunked) && method != HttpMethod.Head
 
                     val writerJob = if (hasBody) GlobalScope.writer(callContext, autoFlush = true) {
-                        parseHttpBody(contentLength, transferEncoding, connectionType, inputChannel, channel)
+                        val input =
+                            if (contentLength < 0) inputChannel else inputChannel.consume(contentLength, callContext)
+
+                        parseHttpBody(contentLength, transferEncoding, connectionType, input, channel)
                     } else null
 
                     task.response.complete(
@@ -112,3 +117,30 @@ internal class ConnectionPipeline(
         responseHandler.start()
     }
 }
+
+private fun ByteReadChannel.consume(
+    contentLength: Long, context: CoroutineContext
+): ByteReadChannel = GlobalScope.writer(context) {
+    HttpClientDefaultPool.useInstance { buffer ->
+        var remaining = contentLength
+        while (remaining > 0) {
+            buffer.clear()
+            if (remaining < buffer.limit()) buffer.limit(remaining.toInt())
+
+            val read = readAvailable(buffer)
+            if (read <= 0) throw NotEnoughBytesException("Fail to read bytes. Remaining: $remaining")
+
+            remaining -= read
+
+            buffer.flip()
+            try {
+                channel.writeFully(buffer)
+            } catch (cause: Throwable) {
+                discard(remaining)
+                remaining = 0
+            }
+        }
+    }
+}.channel
+
+class NotEnoughBytesException(override val message: String) : Throwable()
